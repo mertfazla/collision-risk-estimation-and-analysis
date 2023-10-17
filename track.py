@@ -1,5 +1,6 @@
 import sys
 sys.path.insert(0, './yolov5')
+from modules.init_output import init_out
 
 from yolov5.models.experimental import attempt_load
 from yolov5.utils.downloads import attempt_download
@@ -34,6 +35,8 @@ MAX_DISTANCE = 30
 object_size_data = {}
 waiting_queue = {}
 speed_data = {}
+
+output_directory = "outputs"
 
 def calculate_collision_risk(speed, distance):
     if speed == None:
@@ -98,6 +101,11 @@ def detect(opt):
    
     dataset = LoadImages(source, img_size=image_size, stride=stride)
     t0 = time.time()
+
+    vid_cap = cv2.VideoCapture(source)
+    frame_width = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    writer = init_out(output_directory, frame_width, frame_height)
 
     # Each frame in the video
     for i, (path, img, frames, vid_cap) in enumerate(dataset):
@@ -244,9 +252,12 @@ def detect(opt):
 
         # Stream results
         cv2.imshow(p, frame)
+        writer.write(frame)
         if cv2.waitKey(1) == ord('q'):  # Q to quit
             exit()
     #print('Done. (%.3fs)' % (time.time() - t0))
+    writer.release()
+    cv2.destroyAllWindows()
 
 
 
