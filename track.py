@@ -12,14 +12,15 @@ from deep_sort_pytorch.utils.parser import get_config
 from deep_sort_pytorch.deep_sort import DeepSort
 import argparse
 import time
-from pathlib import Path
 import cv2
 import torch
 import torch.backends.cudnn as cudnn
 import os
+import numpy as np
+import glob
+import pickle
 
 #os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-
 
 # Specify the actual width of the car
 REAL_CAR_WIDTH = 1.8
@@ -27,21 +28,22 @@ REAL_CAR_HEIGHT = 1.4
 FOCAL_LENGTH = 650  # Specify the focal length of the camera
 EDGE_THRESHOLD = 10  # Threshold value for checking if the bounding box is close to edges
 
-MIN_SPEED = -20
+MIN_SPEED = -2
 MAX_SPEED = 0
 MIN_DISTANCE = 3
-MAX_DISTANCE = 30
+MAX_DISTANCE = 15
 
 object_size_data = {}
 waiting_queue = {}
 speed_data = {}
+M = []
 
 output_directory = "outputs"
 
 def calculate_collision_risk(speed, distance):
     if speed == None:
         return None
-    speed = int(speed)
+    speed = float(speed)
     normalized_speed = (MAX_SPEED - speed) / (MAX_SPEED - MIN_SPEED)
     normalized_distance = (MAX_DISTANCE - distance) / (MAX_DISTANCE - MIN_DISTANCE)
     risk_score = normalized_speed * normalized_distance
@@ -51,13 +53,13 @@ def calculate_distance(width_in_pixels):
     distance = (FOCAL_LENGTH * REAL_CAR_WIDTH) / width_in_pixels
     return distance
 
-def measure_speed(ObjectID, high_value, l):     
+def measure_speed(ObjectID, high_value, fps):     
     if object_size_data.get(ObjectID) is not None:
         if(waiting_queue[ObjectID] == 0):
-            #print(high_value, "-> ", object_size_data[ObjectID], "Speed-> ",object_size_data[ObjectID]-high_value)
-            speed_data[ObjectID] = object_size_data[ObjectID]-high_value
+            speed_data[ObjectID] = round((((high_value-object_size_data[ObjectID])/5))/(1/30),2)
+            #speed_data[ObjectID] = round((high_value-object_size_data[ObjectID])/(1/fps),2)
             object_size_data[ObjectID] = high_value
-            waiting_queue[ObjectID] = 6
+            waiting_queue[ObjectID] = 0
             return speed_data[ObjectID]
         else:
             waiting_queue[ObjectID] = waiting_queue[ObjectID]-1
@@ -65,10 +67,174 @@ def measure_speed(ObjectID, high_value, l):
                 return speed_data[ObjectID]
     else:
         object_size_data[ObjectID] = high_value
-        waiting_queue[ObjectID] = 6
+        waiting_queue[ObjectID] = 0
 
+def undistort(img, cal_dir='camera_cal/cal_pickle.p'):
+    #cv2.imwrite('camera_cal/test_cal.jpg', dst)
+    with open(cal_dir, mode='rb') as f:
+        file = pickle.load(f)
+    mtx = file['mtx']
+    dist = file['dist']
+    dst = cv2.undistort(img, mtx, dist, None, mtx)
+    return dst
 
-  
+def pipeline(img, s_thresh=(100, 255), sx_thresh=(15, 255)):
+    img = undistort(img)
+    img = np.copy(img)
+    # Convert to HLS color space and separate the V channel
+    hls = cv2.cvtColor(img, cv2.COLOR_RGB2HLS).astype(np.float32)
+    l_channel = hls[:,:,1]
+    s_channel = hls[:,:,2]
+    h_channel = hls[:,:,0]
+    # Sobel x
+    sobelx = cv2.Sobel(l_channel, cv2.CV_64F, 1, 1) # Take the derivative in x
+    abs_sobelx = np.absolute(sobelx) # Absolute x derivative to accentuate lines away from horizontal
+    scaled_sobel = np.uint8(255*abs_sobelx/np.max(abs_sobelx))
+    
+    # Threshold x gradient
+    sxbinary = np.zeros_like(scaled_sobel)
+    sxbinary[(scaled_sobel >= sx_thresh[0]) & (scaled_sobel <= sx_thresh[1])] = 1
+    
+    # Threshold color channel
+    s_binary = np.zeros_like(s_channel)
+    s_binary[(s_channel >= s_thresh[0]) & (s_channel <= s_thresh[1])] = 1
+    
+    color_binary = np.dstack((np.zeros_like(sxbinary), sxbinary, s_binary)) * 255
+    
+    combined_binary = np.zeros_like(sxbinary)
+    combined_binary[(s_binary == 1) | (sxbinary == 1)] = 1
+    return combined_binary
+
+def perspective_warp(img, 
+                     dst_size=(1920,1080),
+                     src=np.float32([(0.43,0.65),(0.58,0.65),(0.1,1),(1,1)]),
+                     dst=np.float32([(0,0.4), (1, 0.4), (0,1), (1,1)])):
+    img_size = np.float32([(img.shape[1],img.shape[0])])
+    src = src* img_size
+    dst = dst * np.float32(dst_size)
+    # Given src and dst points, calculate the perspective transform matrix
+    M = cv2.getPerspectiveTransform(src, dst)
+    # Warp the image using OpenCV warpPerspective()
+    warped = cv2.warpPerspective(img, M, dst_size)
+    return warped
+
+def inv_perspective_warp(img, 
+                     dst_size=(1920,1080),
+                     src=np.float32([(0,0.4), (1, 0.4), (0,1), (1,1)]),
+                     dst=np.float32([(0.43,0.65),(0.58,0.65),(0.1,1),(1,1)])):
+    img_size = np.float32([(img.shape[1],img.shape[0])])
+    src = src* img_size
+    dst = dst * np.float32(dst_size)
+    # Given src and dst points, calculate the perspective transform matrix
+    M.clear()
+    Mx = cv2.getPerspectiveTransform(src, dst)
+    M.append(Mx)
+
+    # Warp the image using OpenCV warpPerspective()
+    warped = cv2.warpPerspective(img, Mx, dst_size)
+    # get the coordinate of the perspective lane
+    return warped
+
+def get_hist(img):
+    hist = np.sum(img[img.shape[0]//2:,:], axis=0)
+    return hist
+
+left_a, left_b, left_c = [],[],[]
+right_a, right_b, right_c = [],[],[]
+
+def sliding_window(img, nwindows=30, margin=60, minpix = 1, draw_windows=True):
+    global left_a, left_b, left_c,right_a, right_b, right_c 
+    left_fit_= np.empty(3)
+    right_fit_ = np.empty(3)
+    out_img = np.dstack((img, img, img))*255
+
+    histogram = get_hist(img)
+    # find peaks of left and right halves
+    midpoint = int(histogram.shape[0]/2)
+    leftx_base = np.argmax(histogram[:midpoint])
+    rightx_base = np.argmax(histogram[midpoint:]) + midpoint
+    
+    # Set height of windows
+    window_height = np.int16(img.shape[0]/nwindows)
+    # Identify the x and y positions of all nonzero pixels in the image
+    nonzero = img.nonzero()
+    nonzeroy = np.array(nonzero[0])
+    nonzerox = np.array(nonzero[1])
+    # Current positions to be updated for each window
+    leftx_current = leftx_base
+    rightx_current = rightx_base
+    
+    # Create empty lists to receive left and right lane pixel indices
+    left_lane_inds = []
+    right_lane_inds = []
+
+    # Step through the windows one by one
+    for window in range(nwindows):
+        # Identify window boundaries in x and y (and right and left)
+        win_y_low = img.shape[0] - (window+1)*window_height
+        win_y_high = img.shape[0] - window*window_height
+        win_xleft_low = leftx_current - margin
+        win_xleft_high = leftx_current + margin
+        win_xright_low = rightx_current - margin
+        win_xright_high = rightx_current + margin
+        # Draw the windows on the visualization image
+        if draw_windows == True:
+            cv2.rectangle(out_img,(win_xleft_low,win_y_low),(win_xleft_high,win_y_high),
+            (100,255,255), 3) 
+            cv2.rectangle(out_img,(win_xright_low,win_y_low),(win_xright_high,win_y_high),
+            (100,255,255), 3) 
+        # Identify the nonzero pixels in x and y within the window
+        good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
+        (nonzerox >= win_xleft_low) &  (nonzerox < win_xleft_high)).nonzero()[0]
+        good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
+        (nonzerox >= win_xright_low) &  (nonzerox < win_xright_high)).nonzero()[0]
+        # Append these indices to the lists
+        left_lane_inds.append(good_left_inds)
+        right_lane_inds.append(good_right_inds)
+        # If you found > minpix pixels, recenter next window on their mean position
+        if len(good_left_inds) > minpix:
+            leftx_current = np.int16(np.mean(nonzerox[good_left_inds]))
+        if len(good_right_inds) > minpix:        
+            rightx_current = np.int16(np.mean(nonzerox[good_right_inds]))
+
+    # Concatenate the arrays of indices
+    left_lane_inds = np.concatenate(left_lane_inds)
+    right_lane_inds = np.concatenate(right_lane_inds)
+
+    # Extract left and right line pixel positions
+    leftx = nonzerox[left_lane_inds]
+    lefty = nonzeroy[left_lane_inds] 
+    rightx = nonzerox[right_lane_inds]
+    righty = nonzeroy[right_lane_inds] 
+
+    # Fit a second order polynomial to each
+    left_fit = np.polyfit(lefty, leftx, 2)
+    right_fit = np.polyfit(righty, rightx, 2)
+    
+    left_a.append(left_fit[0])
+    left_b.append(left_fit[1])
+    left_c.append(left_fit[2])
+    
+    right_a.append(right_fit[0])
+    right_b.append(right_fit[1])
+    right_c.append(right_fit[2])
+
+    left_fit_[0] = np.mean(left_a[-10:])
+    left_fit_[1] = np.mean(left_b[-10:])
+    left_fit_[2] = np.mean(left_c[-10:])
+    right_fit_[0] = np.mean(right_a[-10:])
+    right_fit_[1] = np.mean(right_b[-10:])
+    right_fit_[2] = np.mean(right_c[-10:])
+    
+    # Generate x and y values for plotting
+    ploty = np.linspace(0, img.shape[0]-1, img.shape[0] )
+    left_fitx = left_fit_[0]*ploty**2 + left_fit_[1]*ploty + left_fit_[2]
+    right_fitx = right_fit_[0]*ploty**2 + right_fit_[1]*ploty + right_fit_[2]
+
+    out_img[nonzeroy[left_lane_inds], nonzerox[left_lane_inds]] = [255, 0, 100]
+    out_img[nonzeroy[right_lane_inds], nonzerox[right_lane_inds]] = [0, 100, 255]
+    
+    return out_img, (left_fitx, right_fitx), (left_fit_, right_fit_), ploty
 
 def detect(opt):
     source, yolo_weights, imgsz = opt.source, opt.yolo_weights, opt.img_size
@@ -100,12 +266,13 @@ def detect(opt):
         model.half()  # to FP16
    
     dataset = LoadImages(source, img_size=image_size, stride=stride)
-    t0 = time.time()
 
     vid_cap = cv2.VideoCapture(source)
     frame_width = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     writer = init_out(output_directory, frame_width, frame_height)
+
+    t0 = time.time()
 
     # Each frame in the video
     for i, (path, img, frames, vid_cap) in enumerate(dataset):
@@ -118,27 +285,6 @@ def detect(opt):
         frameWidth = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frameHeight = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        rectangle1_x1 = (int)(frameWidth/2 - (int)(frameWidth/100)*5)
-        rectangle1_y1 = frameHeight - (int)(frameHeight/100)*41
-        rectangle1_x2 = (int)(frameWidth/2 + (int)(frameWidth/100)*5)
-        rectangle1_y2 = frameHeight - (int)(frameHeight/100)*37
-
-        rectangle2_x1 = (int)(frameWidth/2 - (int)(frameWidth/100)*8)
-        rectangle2_y1 = frameHeight - (int)(frameHeight/100)*36
-        rectangle2_x2 = (int)(frameWidth/2 + (int)(frameWidth/100)*8)
-        rectangle2_y2 = frameHeight - (int)(frameHeight/100)*29
-
-        rectangle3_x1 = (int)(frameWidth/2 - (int)(frameWidth/100)*12)
-        rectangle3_y1 = frameHeight - (int)(frameHeight/100)*28
-        rectangle3_x2 = (int)(frameWidth/2 + (int)(frameWidth/100)*12)
-        rectangle3_y2 = frameHeight - (int)(frameHeight/100)*21
-
-        rectangle4_x1 = (int)(frameWidth/2 - (int)(frameWidth/100)*17)
-        rectangle4_y1 = frameHeight - (int)(frameHeight/100)*20
-        rectangle4_x2 = (int)(frameWidth/2 + (int)(frameWidth/100)*17)
-        rectangle4_y2 = frameHeight - (int)(frameHeight/100)*10
-
-
         # Inference
         t1 = time_sync()
         predictions = model(img)[0]
@@ -150,7 +296,42 @@ def detect(opt):
         p, frame = path, frames
         cv2.namedWindow(p, cv2.WINDOW_NORMAL)
         (screen_x, screen_y, windowWidth, windowHeight) = cv2.getWindowImageRect(p)
-    
+
+        img_lane = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img_lane = cv2.resize(img_lane, (1920, 1080))
+        dst = pipeline(img_lane)
+        dst = perspective_warp(dst)
+        out_img, curves, lanes, ploty = sliding_window(dst) 
+
+        left_fit, right_fit = curves[0], curves[1]
+        ploty = np.linspace(0, img_lane.shape[0]-1, img_lane.shape[0])
+        color_img = np.zeros_like(img_lane)
+        
+        left = np.array([np.transpose(np.vstack([left_fit, ploty]))])
+        right = np.array([np.flipud(np.transpose(np.vstack([right_fit, ploty])))])
+        points = np.hstack((left, right))
+     
+        inv_perspective = inv_perspective_warp(color_img)
+        # Assuming `M` is the perspective transform matrix obtained during the perspective warp
+        # `left` and `right` are the coordinates of the polylines in the original perspective image
+
+        # Reshape the coordinates to match the expected input shape for perspective transform
+        left = left.reshape((-1, 1, 2))
+        right = right.reshape((-1, 1, 2))
+
+        # Apply perspective transform to the coordinates
+        left_transformed = cv2.perspectiveTransform(left, M[0])
+        right_transformed = cv2.perspectiveTransform(right, M[0])
+
+        # Convert the transformed coordinates to integers
+        left_transformed = np.int32(left_transformed)
+        right_transformed = np.int32(right_transformed)
+
+        all_transformed = np.concatenate((left_transformed, right_transformed), axis=0)
+        # Draw the polylines on the image
+        cv2.polylines(inv_perspective, [all_transformed], isClosed=True, color=(255,0,255), thickness=5)
+        img_ = inv_perspective
+
         if detection is not None and len(detection):
             # Rescale boxes from img_size to frame size
             detection[:, :4] = scale_coords(img.shape[2:], detection[:, :4], frame.shape).round()
@@ -175,7 +356,6 @@ def detect(opt):
                     car_width_in_pixels = box_width / visible_area_ratio
                     distance_vector = calculate_distance(car_width_in_pixels)
                     
-                    
                     # Check if the bounding box is close to the edges of the frame
                     #if x1 <= EDGE_THRESHOLD or y1 <= EDGE_THRESHOLD or x2 >= frame_width - EDGE_THRESHOLD or y2 >= frame_height - EDGE_THRESHOLD:
                     ObjectID = output[4]
@@ -186,46 +366,24 @@ def detect(opt):
                     dangerColor = (255,255,0)
                     collisionWarningColor = (255,255,0)
                     carArea = (y2-y1)
+                    # define an array of three points on image to draw the polylines
+                    # shape of point array [3,2]
 
-                    if (rectangle1_x1 <= x1 <= rectangle1_x2 or rectangle1_x1 <= x2 <= rectangle1_x2) and rectangle1_y1 <= y2 <= rectangle1_y2:
-                        speed_string = measure_speed(ObjectID, carArea, 1)
+                    processing_time = t2 - t1
+                    fps = 1 / processing_time
+                    
+                    if (cv2.pointPolygonTest(all_transformed, (x2, y2), False) >= 0) or (cv2.pointPolygonTest(all_transformed, (x1, y2), False) >= 0):
+                        speed_string = measure_speed(ObjectID, distance_vector, fps)
                         collision_risk = calculate_collision_risk(speed_string, distance_vector)
                         dangerColor = (124,252,0) if distance_vector < 5 else (124,252,0) 
-                    elif (rectangle2_x1 <= x1 <= rectangle2_x2 or rectangle2_x1 <= x2 <= rectangle2_x2) and rectangle1_y2 <= y2 <= rectangle2_y1:
-                        speed_string = measure_speed(ObjectID, carArea, 2)
-                        collision_risk = calculate_collision_risk(speed_string, distance_vector)
-                        dangerColor = (124,252,0) if distance_vector < 5 else (124,252,0) 
-                    elif (rectangle2_x1 <= x1 <= rectangle2_x2 or rectangle2_x1 <= x2 <= rectangle2_x2) and rectangle2_y1 <= y2 <= rectangle2_y2:
-                        speed_string = measure_speed(ObjectID, carArea, 3)
-                        collision_risk = calculate_collision_risk(speed_string, distance_vector)
-                        dangerColor = (0,255,0) if distance_vector < 5 else (124,252,0) 
-                    elif (rectangle2_x1 <= x1 <= rectangle2_x2 or rectangle2_x1 <= x2 <= rectangle2_x2) and rectangle2_y2 <= y2 <= rectangle3_y1:
-                        speed_string = measure_speed(ObjectID, carArea, 4)
-                        collision_risk = calculate_collision_risk(speed_string, distance_vector)
-                        dangerColor = (0,255,0) if distance_vector < 5 else (124,252,0) 
-                    elif (rectangle3_x1 <= x1 <= rectangle3_x2 or rectangle3_x1 <= x2 <= rectangle3_x2) and rectangle3_y1 <= y2 <= rectangle3_y2:
-                        speed_string = measure_speed(ObjectID, carArea, 5)
-                        collision_risk = calculate_collision_risk(speed_string, distance_vector)
-                        dangerColor = (0,255,0) if distance_vector < 5 else (124,252,0) 
-                    elif (rectangle2_x1 <= x1 <= rectangle2_x2 or rectangle2_x1 <= x2 <= rectangle2_x2) and rectangle3_y2 <= y2 <= rectangle4_y1:
-                        speed_string = measure_speed(ObjectID, carArea, 6)
-                        collision_risk = calculate_collision_risk(speed_string, distance_vector)
-                        dangerColor = (0,255,0) if distance_vector < 5 else (124,252,0) 
-                    elif (rectangle4_x1 <= x1 <= rectangle4_x2 or rectangle4_x1 <= x2 <= rectangle4_x2) and rectangle4_y1 <= y2 <= rectangle4_y2:
-                        speed_string = measure_speed(ObjectID, carArea, 7)
-                        collision_risk = calculate_collision_risk(speed_string, distance_vector)
-                        dangerColor = (0,255,0) if distance_vector < 5 else (124,252,0) 
-                    elif (rectangle2_x1 <= x1 <= rectangle2_x2 or rectangle2_x1 <= x2 <= rectangle2_x2) and y2 > rectangle2_y2:
-                        speed_string = measure_speed(ObjectID, carArea, 8)
-                        collision_risk = calculate_collision_risk(speed_string, distance_vector)
-                        dangerColor = (0,255,0) if distance_vector < 9 else (124,252,0) 
                     else: 
                         if object_size_data.get(ObjectID) is not None:
                             object_size_data.pop(ObjectID)
+
                     speed_string = speed_string if speed_string != None else ""
                     forwardSpeed = (255, 255, 255)
                     if speed_string != "":
-                        forwardSpeed = (0, 255, 0) if int(speed_string) >= 0 else (0, 0, 255)
+                        forwardSpeed = (0, 255, 0) if float(speed_string) >= 0 else (0, 0, 255)
     
                     if collision_risk != None:
                         if collision_risk > 0.80:
@@ -235,11 +393,8 @@ def detect(opt):
                         else: collisionWarningColor = (0, 255, 0)
                         cv2.putText(frame, f"{round(collision_risk, 2)}"  , (x1, y2 - 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, collisionWarningColor, 2)    
-                            
-                    cv2.rectangle(frame, (rectangle1_x1, rectangle1_y1), (rectangle1_x2, rectangle1_y2), (255, 128, 0), 2)
-                    cv2.rectangle(frame, (rectangle2_x1, rectangle2_y1), (rectangle2_x2, rectangle2_y2), (255, 128, 0), 2)
-                    cv2.rectangle(frame, (rectangle3_x1, rectangle3_y1), (rectangle3_x2, rectangle3_y2), (255, 128, 0), 2)
-                    cv2.rectangle(frame, (rectangle4_x1, rectangle4_y1), (rectangle4_x2, rectangle4_y2), (255, 128, 0), 2)
+                        
+                    # cv2.polylines(frame, [pts], isClosed=True, color=(255,0,0), thickness = 2)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), dangerColor, 2)
                     cv2.putText(frame, f"{ObjectID} | {distance_vector:.2f}"  , (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2,)
@@ -251,6 +406,10 @@ def detect(opt):
         #print('%sDone. (%.3fs)' % (s, t2 - t1))
 
         # Stream results
+        processing_time = t2 - t1
+        fps = 1 / processing_time
+        print("FPS:", round(fps, 2))
+        frame = cv2.addWeighted(frame, 1, inv_perspective, 0.7, 0)
         cv2.imshow(p, frame)
         writer.write(frame)
         if cv2.waitKey(1) == ord('q'):  # Q to quit
@@ -266,7 +425,7 @@ if __name__ == '__main__':
     parser.add_argument('--yolo_weights', nargs='+', type=str, default='yolov5/weights/yolov5s.pt', help='model.pt path(s)')
     parser.add_argument('--deep_sort_weights', type=str, default='deep_sort_pytorch/deep_sort/deep/checkpoint/ckpt.t7', help='ckpt.t7 path')
     parser.add_argument('--source', type=str, default='video.mp4', help='source')
-    parser.add_argument('--img-size', type=int, default=720, help='inference size (pixels)')
+    parser.add_argument('--img-size', type=int, default=1080, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.4, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.5, help='IOU threshold for NMS')
     parser.add_argument('--fourcc', type=str, default='mp4v', help='output video codec (verify ffmpeg support)')
