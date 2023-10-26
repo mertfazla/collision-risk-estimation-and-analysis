@@ -1,6 +1,7 @@
 import sys
 sys.path.insert(0, './yolov5')
 from modules.init_output import init_out
+from modules.detect_output import detect_out
 
 from yolov5.models.experimental import attempt_load
 from yolov5.utils.downloads import attempt_download
@@ -38,7 +39,16 @@ waiting_queue = {}
 speed_data = {}
 M = []
 
+# OpenCV RGB color list
+RED= (0, 0, 255)
+GREEN= (0, 255, 0)
+BLUE= (255, 0, 0)
+YELLOW= (0, 255, 255)
+ORANGE= (0, 165, 255)
+
+
 output_directory = "outputs"
+detected_image_path = 'detected_frames'
 
 def calculate_collision_risk(speed, distance):
     if speed == None:
@@ -56,7 +66,8 @@ def calculate_distance(width_in_pixels):
 def measure_speed(ObjectID, high_value, fps):     
     if object_size_data.get(ObjectID) is not None:
         if(waiting_queue[ObjectID] == 0):
-            speed_data[ObjectID] = round((((high_value-object_size_data[ObjectID])/5))/(1/30),2)
+            estimated_speed = round((((high_value-object_size_data[ObjectID])/5))/(1/30),2)
+            speed_data[ObjectID] = estimated_speed if speed_data.get(ObjectID) is None else round(((estimated_speed)*60 + speed_data[ObjectID]*40)/100,2)
             #speed_data[ObjectID] = round((high_value-object_size_data[ObjectID])/(1/fps),2)
             object_size_data[ObjectID] = high_value
             waiting_queue[ObjectID] = 0
@@ -276,6 +287,7 @@ def detect(opt):
 
     # Each frame in the video
     for i, (path, img, frames, vid_cap) in enumerate(dataset):
+        t1 = time_sync()
         img = torch.from_numpy(img).to(device)
         img = img.half() if half else img.float()  # uint8 to fp16/32
         img /= 255.0
@@ -286,11 +298,9 @@ def detect(opt):
         frameHeight = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         # Inference
-        t1 = time_sync()
         predictions = model(img)[0]
         predictions = non_max_suppression(predictions, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
         detection = predictions[0]
-        t2 = time_sync()
 
         # Process detections
         p, frame = path, frames
@@ -331,20 +341,27 @@ def detect(opt):
         # Draw the polylines on the image
         cv2.polylines(inv_perspective, [all_transformed], isClosed=True, color=(255,0,255), thickness=5)
         img_ = inv_perspective
+        t2 = time_sync()
 
         if detection is not None and len(detection):
-            # Rescale boxes from img_size to frame size
-            detection[:, :4] = scale_coords(img.shape[2:], detection[:, :4], frame.shape).round()
+            car_truck_detections = detection[(detection[:, 5] == 2) | (detection[:, 5] == 7)]  # Assuming "car" class has index 2 and "truck" class has index 7
+            clss = car_truck_detections[:, 5]
 
-            # Pass detections to deepsort
-            xywhs = xyxy2xywh(detection[:, 0:4])
-            confs = detection[:, 4]
-            clss = detection[:, 5]
-            outputs = deepsort.update(xywhs.cpu(), confs.cpu(), clss.cpu(), frame)
+            # Proceed only if car and truck detections are present
+            if len(car_truck_detections) > 0:
+                # Rescale boxes from img_size to frame size
+                car_truck_detections[:, :4] = scale_coords(img.shape[2:], car_truck_detections[:, :4], frame.shape).round()
+
+                # Pass car and truck detections to deepsort
+                xywhs = xyxy2xywh(car_truck_detections[:, 0:4])
+                confs = car_truck_detections[:, 4]
+                outputs = deepsort.update(xywhs.cpu(), confs.cpu(), clss.cpu(), frame)
             
             # Draw boxes for visualization
             if len(outputs) > 0:
                 for j, (output, conf) in enumerate(zip(outputs, confs)): 
+                    #if clss is not car class, continue
+
                     bboxes = output[0:4]
                     x1, y1, x2, y2 = int(bboxes[0]), int(bboxes[1]), int(bboxes[2]), int(bboxes[3])
                     frame_height, frame_width = frame.shape[:2]
@@ -365,6 +382,7 @@ def detect(opt):
                     speed_int = 0
                     dangerColor = (255,255,0)
                     collisionWarningColor = (255,255,0)
+                    forwardSpeed = (255, 255, 255)
                     carArea = (y2-y1)
                     # define an array of three points on image to draw the polylines
                     # shape of point array [3,2]
@@ -375,25 +393,42 @@ def detect(opt):
                     if (cv2.pointPolygonTest(all_transformed, (x2, y2), False) >= 0) or (cv2.pointPolygonTest(all_transformed, (x1, y2), False) >= 0):
                         speed_string = measure_speed(ObjectID, distance_vector, fps)
                         collision_risk = calculate_collision_risk(speed_string, distance_vector)
-                        dangerColor = (124,252,0) if distance_vector < 5 else (124,252,0) 
+                        dangerColor = YELLOW if distance_vector < 5 else GREEN
                     else: 
                         if object_size_data.get(ObjectID) is not None:
-                            object_size_data.pop(ObjectID)
-
+                            object_size_data.pop(ObjectID)   
                     speed_string = speed_string if speed_string != None else ""
-                    forwardSpeed = (255, 255, 255)
+                    
                     if speed_string != "":
-                        forwardSpeed = (0, 255, 0) if float(speed_string) >= 0 else (0, 0, 255)
-    
-                    if collision_risk != None:
-                        if collision_risk > 0.80:
-                            collisionWarningColor = (255, 0, 0)
-                        elif collision_risk > 0.5:
-                            collisionWarningColor = (255, 255, 0)
-                        else: collisionWarningColor = (0, 255, 0)
-                        cv2.putText(frame, f"{round(collision_risk, 2)}"  , (x1, y2 - 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, collisionWarningColor, 2)    
-                        
+                        forwardSpeed = GREEN if float(speed_string) >= 0 else RED
+                    
+                    if collision_risk != None:     
+                        if collision_risk >= 0.5 and collision_risk < 0.80:
+                            cv2.putText(frame, f"{round(collision_risk, 1)}"  , (x1, y2 - 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, ORANGE, 2)
+                            cv2.putText(frame, f"WARNING !", (x1, (int)(y1 + (y2-y1)/2)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, ORANGE, 2)
+                            cv2.putText(frame, "Medium collision risk detected", (x1, (int)(y1 + (y2-y1)/2 + 20)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, ORANGE, 2)
+                            dangerColor = ORANGE
+                            isWritten = detect_out(detected_image_path, frame, 2)
+                            if isWritten:
+                                print('Medium collision risk detected and frame is successfully saved')
+                        elif collision_risk >= 0.80:
+                            cv2.putText(frame, f"{round(collision_risk, 2)}"  , (x1, y2 - 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, RED, 2)
+                            cv2.putText(frame, f"WARNING !", (x1, (int)(y1 + (y2-y1)/2)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, RED, 2)
+                            cv2.putText(frame, "High collision risk detected", (x1, (int)(y1 + (y2-y1)/2 + 20)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, RED, 2)
+                            dangerColor = RED
+                            isWritten = detect_out(detected_image_path, frame, 1)
+                            if isWritten:
+                                print('High collision risk detected and frame is successfully saved')
+                        else: 
+                            cv2.putText(frame, f"{round(collision_risk, 2)}"  , (x1, y2 - 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREEN, 2)
+       
                     # cv2.polylines(frame, [pts], isClosed=True, color=(255,0,0), thickness = 2)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), dangerColor, 2)
                     cv2.putText(frame, f"{ObjectID} | {distance_vector:.2f}"  , (x1, y1 - 10),
@@ -403,7 +438,6 @@ def detect(opt):
                     
         else:
             deepsort.increment_ages()
-        #print('%sDone. (%.3fs)' % (s, t2 - t1))
 
         # Stream results
         processing_time = t2 - t1
@@ -414,7 +448,6 @@ def detect(opt):
         writer.write(frame)
         if cv2.waitKey(1) == ord('q'):  # Q to quit
             exit()
-    #print('Done. (%.3fs)' % (time.time() - t0))
     writer.release()
     cv2.destroyAllWindows()
 
