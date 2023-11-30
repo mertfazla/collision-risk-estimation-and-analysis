@@ -2,6 +2,7 @@ import sys
 sys.path.insert(0, './yolov5')
 from modules.init_output import init_out
 from modules.detect_output import detect_out
+from modules.send_to_server import send_frame_to_server
 
 from yolov5.models.experimental import attempt_load
 from yolov5.utils.downloads import attempt_download
@@ -29,8 +30,8 @@ REAL_CAR_HEIGHT = 1.4
 FOCAL_LENGTH = 650  # Specify the focal length of the camera
 EDGE_THRESHOLD = 10  # Threshold value for checking if the bounding box is close to edges
 
-MIN_SPEED = -2
-MAX_SPEED = 0
+MIN_SPEED = 1
+MAX_SPEED = 2
 MIN_DISTANCE = 3
 MAX_DISTANCE = 15
 
@@ -425,6 +426,9 @@ def detect(opt):
                             isWritten = detect_out(detected_image_path, frame, 1)
                             if isWritten:
                                 print('High collision risk detected and frame is successfully saved')
+                                # post this frame the /localhost:8080/api/detect
+                                send_frame_to_server(frame)
+
                         else: 
                             cv2.putText(frame, f"{round(collision_risk, 2)}"  , (x1, y2 - 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREEN, 2)
