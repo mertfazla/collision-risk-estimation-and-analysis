@@ -18,11 +18,17 @@ import cv2
 import torch
 import numpy as np
 
+# matplotlib.use('TkAgg')
+# import matplotlib.pyplot as plt
+
 #os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 # Specify the actual width and height of the car
 REAL_CAR_WIDTH = 1.8
 REAL_CAR_HEIGHT = 1.4
+REAL_TRUCK_WIDTH = 2.6
+
+CAR_ASPECT_RATIO = REAL_CAR_WIDTH / REAL_CAR_HEIGHT
 
 # Specify the focal length of the camera
 FOCAL_LENGTH = 650 
@@ -30,7 +36,7 @@ FOCAL_LENGTH = 650
 # Threshold value for checking if the bounding box is close to edges
 EDGE_THRESHOLD = 10 
 
-MIN_SPEED = -3
+MIN_SPEED = -1.5
 MAX_SPEED = 0
 MIN_DISTANCE = 3
 MAX_DISTANCE = 15
@@ -49,7 +55,10 @@ ORANGE= (0, 165, 255)
 DIR_OUTPUT = "outputs"
 DIR_DETECTED_IMAGE = 'detected_frames'
 
+
 global dangerStatus;
+global limit_y
+global limit_y_quaue
 
 def calculate_collision_risk(speed, distance):
     if speed == None:
@@ -60,10 +69,16 @@ def calculate_collision_risk(speed, distance):
     risk_score = normalized_speed * normalized_distance
     if(risk_score > 1):
         risk_score = 1
+    elif(risk_score < 0):
+        risk_score = 0
     return risk_score
 
-def calculate_distance(width_in_pixels):
-    distance = (FOCAL_LENGTH * REAL_CAR_WIDTH) / width_in_pixels
+def calculate_distance(width_in_pixels, isTruck=False):
+    distance = 0
+    if isTruck:
+        distance = (FOCAL_LENGTH * REAL_TRUCK_WIDTH) / width_in_pixels
+    else:
+        distance = (FOCAL_LENGTH * REAL_CAR_WIDTH) / width_in_pixels
     return distance
 
 def measure_speed(ObjectID, high_value, fps):     
@@ -118,6 +133,7 @@ def detect(opt):
 
     t0 = time.time()
     dangerStatus = 0
+    limit_y = 600
 
     # Each frame in the video
     for i, (path, img, frames, vid_cap) in enumerate(dataset):
@@ -151,6 +167,9 @@ def detect(opt):
         dst = perspective_warp(dst)
 
         out_img, curves, lanes, ploty = sliding_window(dst);
+        #resize out_img
+        out_img = cv2.resize(out_img, (1280, 720))
+        cv2.imshow('out_img', out_img)
 
         left_fit, right_fit = curves[0], curves[1]
 
@@ -161,18 +180,8 @@ def detect(opt):
         right = np.array([np.flipud(np.transpose(np.vstack([right_fit, ploty])))])
         points = np.hstack((left, right))
 
-        # left[:, :, 0] = np.clip(left[:, :, 0], 300, 1500)
-        # right[:, :, 0] = np.clip(left[:, :, 0], 1200, 1500)
-
-        # limit the matrix the left and right y value min 900 px, if less than 900 px, delete the matrix line
-        left = left[left[:, :, 1] > 700]
-        right = right[right[:, :, 1] > 700]
-
         inv_perspective = inv_perspective_warp(color_img)
-        # Assuming `M` is the perspective transform matrix obtained during the perspective warp
-        # `left` and `right` are the coordinates of the polylines in the original perspective image
 
-        # Reshape the coordinates to match the expected input shape for perspective transform
         left = left.reshape((-1, 1, 2))
         right = right.reshape((-1, 1, 2))
 
@@ -186,13 +195,9 @@ def detect(opt):
         left_transformed = np.int32(left_transformed)
         right_transformed = np.int32(right_transformed)
 
-        # x_min = 100
-        x_max = 500
-
         all_transformed = np.concatenate((left_transformed, right_transformed), axis=0)
+        limit_y_quaue = []
 
-        # Draw the polylines on the image
-        cv2.polylines(inv_perspective, [all_transformed], isClosed=True, color=(255,0,255), thickness=5)
         img_ = inv_perspective
         t2 = time_sync()
 
@@ -217,32 +222,46 @@ def detect(opt):
                     bboxes = output[0:4]
                     x1, y1, x2, y2 = int(bboxes[0]), int(bboxes[1]), int(bboxes[2]), int(bboxes[3])
                     frame_height, frame_width = frame.shape[:2]
-                    car_aspect_ratio = REAL_CAR_WIDTH / REAL_CAR_HEIGHT
+
+                    # Calculate the distance of the car from the camera
                     box_height = y2 - y1
                     box_width = x2 - x1
-                    visible_area_ratio = box_width / (box_height * car_aspect_ratio)
-                    estimated_real_width = REAL_CAR_WIDTH * visible_area_ratio
+                    visible_area_ratio = box_width / (box_height * CAR_ASPECT_RATIO)
                     car_width_in_pixels = box_width / visible_area_ratio
-                    distance_vector = calculate_distance(car_width_in_pixels)
+                    distance_vector = 0
+                    if(output[5] == 7):
+                        car_width_in_pixels = box_width / visible_area_ratio
+                        distance_vector = calculate_distance(car_width_in_pixels, True)
+                    else:
+                        car_width_in_pixels = box_width / visible_area_ratio
+                        distance_vector = calculate_distance(car_width_in_pixels)
+
                     
                     # Check if the bounding box is close to the edges of the frame
                     #if x1 <= EDGE_THRESHOLD or y1 <= EDGE_THRESHOLD or x2 >= frame_width - EDGE_THRESHOLD or y2 >= frame_height - EDGE_THRESHOLD:
-                    ObjectID = output[4]
-                    classString = output[5]
+
+                    ObjectID, classString = output[4], output[5]
+
+                    
                     speed_string = ""
                     collision_risk = None
-                    speed_int = 0
                     dangerColor = (255,255,0)
-                    collisionWarningColor = (255,255,0)
                     forwardSpeed = (255, 255, 255)
-                    carArea = (y2-y1)
 
                     processing_time = t2 - t1
                     fps = 1 / processing_time
                     
+                    # Check if the car inside the risk analysis area
                     if (cv2.pointPolygonTest(all_transformed, (x2, y2), False) >= 0) or (cv2.pointPolygonTest(all_transformed, (x1, y2), False) >= 0):
                         speed_string = measure_speed(ObjectID, distance_vector, fps)
                         collision_risk = calculate_collision_risk(speed_string, distance_vector)
+                        speed = speed_string if speed_string != None else 0
+                        if speed < 0:
+                            limit_speed_y = abs(speed*10)
+                            limit_y_quaue.append(y2+limit_speed_y)
+                        else:
+                            limit_y_quaue.append(y2)
+                        
                         dangerColor = YELLOW if distance_vector < 5 else GREEN
                     else: 
                         if object_size_data.get(ObjectID) is not None:
@@ -252,6 +271,7 @@ def detect(opt):
                     if speed_string != "":
                         forwardSpeed = GREEN if float(speed_string) >= 0 else RED
                     
+                    # Check if the car's risk score is above the threshold and write the risk text accordingly
                     if collision_risk != None:     
                         if collision_risk >= 0.5 and collision_risk < 0.80:
                             cv2.putText(frame, f"{round((collision_risk*100), 1)}%"  , (x1, y2 - 30),
@@ -275,9 +295,8 @@ def detect(opt):
                             cv2.putText(frame, f"{round((collision_risk*100), 2)}%"  , (x1, y2 - 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREEN, 2)
        
-                    # cv2.polylines(frame, [pts], isClosed=True, color=(255,0,0), thickness = 2)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), dangerColor, 2)
-                    cv2.putText(frame, f"{ObjectID} | {distance_vector:.2f}"  , (x1, y1 - 10),
+                    cv2.putText(frame, f"{ObjectID} | {distance_vector:.2f} m"  , (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2,)
                     cv2.putText(frame, f"{speed_string}"  , (x1, y2 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, forwardSpeed, 2)
@@ -285,10 +304,28 @@ def detect(opt):
         else:
             deepsort.increment_ages()
 
-        # Stream results
+        all_transformed = np.concatenate((left_transformed, right_transformed), axis=0)
+
+        if(len(limit_y_quaue) != 0):
+            certain_y_limit_value = max(limit_y_quaue)
+            certain_y_limit_value = certain_y_limit_value
+            if(certain_y_limit_value > 820):
+                limit_y = 820
+            else:
+                limit_y = certain_y_limit_value
+            limit_y_quaue = []
+        else:
+            limit_y = 600
+        
+        print("result_limit_y: ", limit_y)
+
+        all_transformed = all_transformed[all_transformed[:, :, 1] > limit_y]
+        cv2.polylines(inv_perspective, [all_transformed], isClosed=True, color=(255,0,255), thickness=5)
+
         processing_time = t2 - t1
         fps = 1 / processing_time
         print("FPS:", round(fps, 2))
+    
         frame = cv2.addWeighted(frame, 1, inv_perspective, 0.7, 0)
 
         if(dangerStatus != 0):

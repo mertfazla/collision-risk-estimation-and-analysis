@@ -2,6 +2,9 @@ import cv2
 import numpy as np
 import pickle
 import matplotlib.pyplot as plt
+# video3
+# 0.45,0.51 -  0.55,0.51  -  0.11,1   -   0.95,1
+
 
 M = []
 
@@ -41,6 +44,7 @@ def pipeline(img, s_thresh=(170, 255), sx_thresh=(20, 255)):
     sobelx = cv2.Sobel(l_channel, cv2.CV_64F, 1, 1)
     abs_sobelx = np.absolute(sobelx) # Absolute x derivative to accentuate lines away from horizontal
     scaled_sobel = np.uint8(255*abs_sobelx/np.max(abs_sobelx))
+    # cv2.imshow('perspective_wrap2o', sobelx)
     
     # Threshold x gradient
     sxbinary = np.zeros_like(scaled_sobel)
@@ -57,8 +61,8 @@ def pipeline(img, s_thresh=(170, 255), sx_thresh=(20, 255)):
 
 def perspective_warp(img, 
                      dst_size=(1920,1080),
-                     src=np.float32([(0.42,0.66),(0.60,0.66),(0,1),(1,1)]),
-                     dst=np.float32([(0,0.4), (1, 0.4), (0,1), (1,1)])):
+                     src=np.float32([(0.46,0.51),(0.54,0.51),(0.08,1),(1.1,1)]),
+                     dst=np.float32([(0,0), (1, 0), (0,1), (1,1)])):
     img_size = np.float32([(img.shape[1],img.shape[0])])
     src = src* img_size
     dst = dst * np.float32(dst_size)
@@ -73,8 +77,8 @@ def perspective_warp(img,
 
 def inv_perspective_warp(img, 
                      dst_size=(1920,1080),
-                     src=np.float32([(0,0.4), (1, 0.4), (0,1), (1,1)]),
-                     dst=np.float32([(0.42,0.66),(0.60,0.66),(0,1),(1,1)])):
+                     src=np.float32([(0,0), (1, 0), (0,1), (1,1)]),
+                     dst=np.float32([(0.45,0.51),(0.55,0.51),(0.07,1),(1.05,1)])):
     img_size = np.float32([(img.shape[1],img.shape[0])])
     src = src* img_size
     dst = dst * np.float32(dst_size)
@@ -88,6 +92,7 @@ def inv_perspective_warp(img,
     warped = cv2.warpPerspective(img, Mx, dst_size)
 
     # get the coordinate of the perspective lane
+    #convert binary to image the warped
     return warped
 
 def get_hist(img):
@@ -97,7 +102,7 @@ def get_hist(img):
 left_a, left_b, left_c = [],[],[]
 right_a, right_b, right_c = [],[],[]
 
-def sliding_window(img, nwindows=30, margin=60, minpix = 1, draw_windows=True):
+def sliding_window(img, nwindows=30, margin=80, minpix = 1, draw_windows=True):
     left_fit_= np.empty(3)
     right_fit_ = np.empty(3)
 
